@@ -613,9 +613,33 @@ def cloud_listener_loop():
     worker = threading.Thread(target=worker_loop, daemon=True)
     worker.start()
 
-    end_time = time.time() + 52 * 60
+    end_time = time.time() + 5 * 3600
+    last_watchdog = 0
     try:
         while time.time() < end_time and not STOP_REQUESTED:
+            if time.time() - last_watchdog > 300:
+                last_watchdog = time.time()
+                gh_tok = os.environ.get("GH_TOKEN", "").strip()
+                if gh_tok:
+                    try:
+                        r = requests.get(
+                            "https://api.github.com/repos/Thucdepzai/eztrading-zalo-bot/actions/runs?per_page=5",
+                            headers={"Authorization": f"Bearer {gh_tok}", "Accept": "application/vnd.github+json"},
+                            timeout=10,
+                        )
+                        if r.status_code == 200:
+                            runs = r.json().get("workflow_runs", [])
+                            active = [x for x in runs if x.get("status") in ("in_progress", "queued", "waiting")]
+                            if not active:
+                                requests.post(
+                                    "https://api.github.com/repos/Thucdepzai/eztrading-zalo-bot/actions/workflows/zalo_signal_bot.yml/dispatches",
+                                    headers={"Authorization": f"Bearer {gh_tok}", "Accept": "application/vnd.github+json"},
+                                    json={"ref": "main"},
+                                    timeout=10,
+                                )
+                                log("Watchdog: Woke up eztrading-zalo-bot workflow!")
+                    except Exception:
+                        pass
             cid, utxt = check_pending_zalo_questions(wait_timeout=25)
             if cid:
                 send_zalo_notification(

@@ -16,12 +16,13 @@ concurrency:
 jobs:
   auto-study:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 340
     env:
       TUAF_USERNAME: ${{ secrets.TUAF_USERNAME }}
       TUAF_PASSWORD: ${{ secrets.TUAF_PASSWORD }}
       ZALO_BOT_TOKEN: ${{ secrets.ZALO_BOT_TOKEN }}
       ZALO_CHAT_ID: ${{ secrets.ZALO_CHAT_ID }}
+      GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -34,13 +35,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run TUAF Auto Study & Reply Zalo
+      - name: Run TUAF Auto Study & Reply Zalo (5 hours continuous)
         run: python -X utf8 auto_study.py
 
       - name: Chain next 24/7 run seamlessly
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_PAT || secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
           curl -s -X POST \

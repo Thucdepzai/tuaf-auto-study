@@ -613,10 +613,7 @@ def cloud_listener_loop():
     worker = threading.Thread(target=worker_loop, daemon=True)
     worker.start()
 
-    if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch':
-        send_zalo_notification("🟢 Bot đám mây GitHub đã sẵn sàng trực tuyến! Đại ca có thể nhắn lệnh bất cứ lúc nào.")
-
-    end_time = time.time() + 55 * 60
+    end_time = time.time() + 52 * 60
     try:
         while time.time() < end_time and not STOP_REQUESTED:
             cid, utxt = check_pending_zalo_questions(wait_timeout=25)

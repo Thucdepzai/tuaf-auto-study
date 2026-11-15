@@ -252,68 +252,94 @@ def complete_scorm(cmid, name=""):
     if not form:
         log(f"  SCORM {cmid} locked or no scormviewform.")
         return False
-    scoid_inp = form.find('input', {'name': 'scoid'})
-    scoid = scoid_inp['value'] if scoid_inp else ''
-    player_url = f'https://tuaf.aum.edu.vn/mod/scorm/player.php?a={form.find("input", {"name": "a"})["value"]}&currentorg=&scoid={scoid}&sesskey={form.find("input", {"name": "sesskey"})["value"]}&display=popup&mode=normal'
-    presp = safe_get(player_url)
-    m_sess = re.search(r'"sesskey"\s*:\s*"([^"]+)"', presp.text)
-    sesskey = m_sess.group(1) if m_sess else form.find("input", {"name": "sesskey"})["value"]
-    a_id = form.find("input", {"name": "a"})["value"]
+    data = {inp.get('name'): inp.get('value', '') for inp in form.find_all('input') if inp.get('name')}
+    player_resp = safe_post(form['action'], data=data)
 
-    datamodel_url = 'https://tuaf.aum.edu.vn/mod/scorm/datamodel.php'
-    payload = {
-        'id': str(cmid),
-        'a': str(a_id),
-        'scoid': str(scoid),
-        'attempt': '1',
-        'sesskey': sesskey,
-        'cmi__core__lesson_status': 'completed',
-        'cmi__core__score__raw': '100',
-        'cmi__core__score__min': '0',
-        'cmi__core__score__max': '100',
-        'cmi__core__total_time': '00:25:13.00',
-        'cmi__core__session_time': '00:25:13.00',
-        'cmi__core__exit': ''
-    }
-    dresp = safe_post(datamodel_url, data=payload)
-    log(f"  SCORM {cmid} datamodel response: {dresp.text.strip()}")
-    return 'true' in dresp.text.lower()
+    init_line = next((line.strip() for line in player_resp.text.splitlines() if 'M.scorm_api.init' in line), None)
+    if not init_line:
+        log(f"  [!] No M.scorm_api.init found for {cmid}")
+        return False
 
-def parse_review_page(html, known_correct, known_wrong):
-    soup = BeautifulSoup(html, 'html.parser')
-    total = 0
-    correct_cnt = 0
-    for q in soup.find_all('div', id=re.compile(r'^question-\d+-\d+$')):
-        total += 1
+    m_def = re.search(r'M\.scorm_api\.init\(Y,\s*(\{.*?\}),\s*(\{.*?\}),\s*(\{.*?\}),', init_line)
+    scoids = list(json.loads(m_def.group(1)).keys()) if m_def else []
+
+    tail_m = re.search(r'"(\d+)",\s*"https:\\/\\/tuaf\.aum\.edu\.vn",\s*"([^"]+)",\s*"(\d+)",\s*"?(\d+)"?,\s*"([^"]+)",\s*(\d+),\s*"([^"]*)"', init_line)
+    if not tail_m:
+        log(f"  [!] Could not parse M.scorm_api.init tail for {cmid}")
+        return False
+    scormid, sesskey, main_scoid, attempt, viewmode, parsed_cmid, currentorg = tail_m.groups()
+
+    load_url = f'https://tuaf.aum.edu.vn/mod/scorm/loadSCO.php?a={scormid}&scoid={main_scoid}&currentorg={currentorg}&mode={viewmode}&attempt={attempt}'
+    safe_get(load_url)
+
+    for sid in [main_scoid] + [s for s in scoids if s != main_scoid]:
+        payload = {
+            'id': str(cmid),
+            'a': str(scormid),
+            'scoid': str(sid),
+            'attempt': str(attempt),
+            'sesskey': sesskey,
+            'cmi__core__lesson_status': 'passed',
+            'cmi__core__score__raw': '100',
+            'cmi__core__score__min': '0',
+            'cmi__core__score__max': '100',
+            'cmi__core__total_time': '00:25:14.00',
+            'cmi__core__session_time': '00:25:14.00',
+            'cmi__core__exit': ''
+        }
+        dresp = safe_post('https://tuaf.aum.edu.vn/mod/scorm/datamodel.php', data=payload)
+        log(f"  SCORM {cmid} scoid={sid} datamodel: {dresp.text.strip()}")
+    return True
+
+def parse_review_page(rev_html, known_correct, known_wrong):
+    revsoup = BeautifulSoup(rev_html, 'html.parser')
+    all_link = revsoup.find('a', href=re.compile(r'review\.php\?.*showall=1'))
+    if all_link:
+        rev_html = safe_get(all_link['href']).text
+        revsoup = BeautifulSoup(rev_html, 'html.parser')
+
+    ques = revsoup.find_all('div', class_=re.compile(r'\bque\b'))
+    correct_count = 0
+    for q in ques:
+        qtext_el = q.find(class_='qtext')
+        if not qtext_el:
+            continue
         qkey = make_q_key(q)
-        classes = q.get('class', [])
-        is_correct = 'correct' in classes
+        q_classes = q.get('class', [])
+        state_el = q.find(class_='state')
+        grade_el = q.find(class_='grade')
+        state_txt = norm(state_el.get_text()) if state_el else ''
+        grade_txt = norm(grade_el.get_text()) if grade_el else ''
 
-        fb = q.find(class_='rightanswer')
-        if fb:
-            fb_txt = norm(fb.get_text())
-            m = re.search(r'(?:Đáp án đúng là|The correct answer is)\s*:\s*(.+)$', fb_txt, re.I)
-            if m:
-                known_correct[qkey] = norm_choice(m.group(1))
+        ra_el = q.find(class_='rightanswer')
+        if ra_el:
+            ra_clean = re.sub(r'^(Câu trả lời đúng là|The correct answer is|Đáp án đúng là)\s*:\s*', '', norm(ra_el.get_text()), flags=re.I)
+            ra_clean = norm_choice(ra_clean)
+            if ra_clean:
+                known_correct[qkey] = ra_clean
 
-        checked_inp = q.find('input', {'type': 'radio', 'checked': True})
-        if not checked_inp:
-            for inp in q.find_all('input', {'type': 'radio'}):
-                if inp.has_attr('checked'):
-                    checked_inp = inp
-                    break
+        selected_choice_txt = None
+        for ans_div in q.select('.answer div.r0, .answer div.r1'):
+            inp = ans_div.find('input', {'type': 'radio'}) or ans_div.find('input', {'type': 'checkbox'})
+            if inp and inp.has_attr('checked'):
+                selected_choice_txt = extract_choice_text(ans_div)
+                if 'correct' in ans_div.get('class', []) and 'incorrect' not in ans_div.get('class', []):
+                    known_correct[qkey] = selected_choice_txt
 
-        if checked_inp:
-            ans_div = checked_inp.find_parent('div', class_=re.compile(r'^r[01]$'))
-            chosen_txt = extract_choice_text(ans_div) if ans_div else ''
-            if is_correct:
-                correct_cnt += 1
-                if chosen_txt:
-                    known_correct[qkey] = chosen_txt
-            else:
-                if chosen_txt:
-                    known_wrong.setdefault(qkey, set()).add(chosen_txt)
-    return correct_cnt, total
+        is_q_correct = (
+            ('correct' in q_classes and 'incorrect' not in q_classes) or
+            ('Đúng' in state_txt and 'Không đúng' not in state_txt) or
+            ('1,00 trên 1,00' in grade_txt) or
+            ('1.00 out of 1.00' in grade_txt)
+        )
+        if is_q_correct:
+            correct_count += 1
+            if selected_choice_txt:
+                known_correct[qkey] = selected_choice_txt
+        elif selected_choice_txt:
+            known_wrong.setdefault(qkey, set()).add(selected_choice_txt)
+
+    return correct_count, len(ques)
 
 def run_quiz_attempt(cmid, known_correct, known_wrong):
     view_url = f'https://tuaf.aum.edu.vn/mod/quiz/view.php?id={cmid}'
@@ -331,7 +357,9 @@ def run_quiz_attempt(cmid, known_correct, known_wrong):
 
     start_resp = safe_post('https://tuaf.aum.edu.vn/mod/quiz/startattempt.php', data={
         'cmid': str(cmid),
-        'sesskey': sesskey
+        'sesskey': sesskey,
+        '_qf__mod_quiz_preflight_check_form': '1',
+        'submitbutton': 'Bắt đầu làm bài'
     })
     m_att = re.search(r'attempt=(\d+)', start_resp.url)
     if not m_att:
@@ -343,66 +371,59 @@ def run_quiz_attempt(cmid, known_correct, known_wrong):
 
     page = 0
     while True:
-        att_url = f'https://tuaf.aum.edu.vn/mod/quiz/attempt.php?attempt={attempt_id}&cmid={cmid}'
-        if page > 0:
-            att_url += f'&page={page}'
-        aresp = safe_get(att_url)
+        att_url = f'https://tuaf.aum.edu.vn/mod/quiz/attempt.php?attempt={attempt_id}&cmid={cmid}&page={page}'
+        aresp = safe_get(att_url) if page > 0 else start_resp
         asoup = BeautifulSoup(aresp.text, 'html.parser')
         form = asoup.find('form', {'id': 'responseform'})
         if not form:
             break
 
-        post_data = {}
-        for inp in form.find_all('input'):
-            name = inp.get('name')
-            itype = inp.get('type', '').lower()
-            if not name or itype in ('radio', 'submit', 'button'):
+        post_data = {inp['name']: inp.get('value', '') for inp in form.find_all('input', {'type': 'hidden'}) if inp.get('name')}
+        for q in form.find_all('div', class_=re.compile(r'\bque\b')):
+            qtext_el = q.find(class_='qtext')
+            if not qtext_el:
                 continue
-            post_data[name] = inp.get('value', '')
-
-        q_divs = form.find_all('div', id=re.compile(r'^question-\d+-\d+$'))
-        for q in q_divs:
             qkey = make_q_key(q)
             ans_divs = q.select('.answer div.r0, .answer div.r1')
-            chosen_val = None
-            chosen_name = None
-
-            options = []
-            for adiv in ans_divs:
-                r_inp = adiv.find('input', {'type': 'radio'})
-                if not r_inp:
-                    continue
-                r_name = r_inp.get('name')
-                r_val = r_inp.get('value')
-                c_txt = extract_choice_text(adiv)
-                options.append((r_name, r_val, c_txt))
-
-            if not options:
+            if not ans_divs:
                 continue
 
-            chosen_name = options[0][0]
+            chosen_name, chosen_val = None, None
             if qkey in known_correct:
-                target = known_correct[qkey]
-                for r_name, r_val, c_txt in options:
-                    if c_txt == target:
-                        chosen_val = r_val
+                target_txt = known_correct[qkey]
+                for adiv in ans_divs:
+                    inp = adiv.find('input', {'type': 'radio'})
+                    if inp and extract_choice_text(adiv) == target_txt:
+                        chosen_name, chosen_val = inp['name'], inp['value']
                         break
+                if chosen_val is None:
+                    for adiv in ans_divs:
+                        inp = adiv.find('input', {'type': 'radio'})
+                        if inp and (target_txt in extract_choice_text(adiv) or extract_choice_text(adiv) in target_txt):
+                            chosen_name, chosen_val = inp['name'], inp['value']
+                            break
 
             if chosen_val is None:
                 wrong_set = known_wrong.get(qkey, set())
-                untried = [(rn, rv, ct) for (rn, rv, ct) in options if ct not in wrong_set]
-                if untried:
-                    chosen_val = untried[0][1]
-                else:
-                    chosen_val = options[0][1]
+                for adiv in ans_divs:
+                    inp = adiv.find('input', {'type': 'radio'})
+                    if inp and extract_choice_text(adiv) not in wrong_set:
+                        chosen_name, chosen_val = inp['name'], inp['value']
+                        break
+
+            if chosen_val is None:
+                inp = ans_divs[0].find('input', {'type': 'radio'})
+                if inp:
+                    chosen_name, chosen_val = inp['name'], inp['value']
 
             if chosen_name and chosen_val is not None:
                 post_data[chosen_name] = chosen_val
 
         next_inp = form.find('input', {'name': 'nextpage'})
         nextpage_val = int(next_inp['value']) if (next_inp and next_inp.get('value', '').lstrip('-').isdigit()) else -1
-        post_data['next'] = 'Next page'
-        safe_post(f'https://tuaf.aum.edu.vn/mod/quiz/processattempt.php?cmid={cmid}', data=post_data)
+        post_data['next'] = 'Trang tiếp'
+        proc_url = form.get('action') or f'https://tuaf.aum.edu.vn/mod/quiz/processattempt.php?cmid={cmid}'
+        safe_post(proc_url, data=post_data)
         if nextpage_val == -1 or nextpage_val <= page:
             break
         page = nextpage_val
